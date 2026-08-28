@@ -208,9 +208,7 @@ function resolveRuntimeNodeInvokeSyntheticScopes(params: {
   requestedScopes?: OperatorScope[];
 }): OperatorScope[] | undefined {
   // Requested scopes may replace caller scopes, so only bundled or trusted official plugins qualify.
-  return params.requestedScopes && canTrustedOfficialPluginRequestScopes(params)
-    ? params.requestedScopes
-    : undefined;
+  return canTrustedOfficialPluginRequestScopes(params) ? params.requestedScopes : undefined;
 }
 
 export async function dispatchTrustedPluginGatewayMethod<T>(
