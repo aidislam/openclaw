@@ -109,14 +109,7 @@ export class NewSessionModelControl {
     hasSnapshot: false,
     status: "idle",
   };
-  private metadataRequestId = 0;
-  private activeMetadataRequest:
-    | {
-        agentId: string;
-        client: NewSessionMetadataClient;
-        id: number;
-      }
-    | undefined;
+  private metadataLoading = false;
   private metadataClient: NewSessionMetadataClient | undefined;
   private metadataUnsubscribe: (() => void) | undefined;
   private restoringPreference = false;
@@ -143,14 +136,6 @@ export class NewSessionModelControl {
     return this.metadataState.catalog;
   }
 
-  private cancelMetadataRequest() {
-    if (!this.activeMetadataRequest) {
-      return;
-    }
-    this.activeMetadataRequest = undefined;
-    this.metadataRequestId += 1;
-  }
-
   private clearMetadataSubscription() {
     this.metadataUnsubscribe?.();
     this.metadataUnsubscribe = undefined;
@@ -162,24 +147,44 @@ export class NewSessionModelControl {
     }
     this.clearMetadataSubscription();
     this.metadataClient = client;
-    this.metadataUnsubscribe = subscribeChatMetadata(client, agentId, () => {
+    this.metadataUnsubscribe = subscribeChatMetadata(client, { agentId }, (update) => {
       if (this.metadataClient !== client || this.agentId !== agentId) {
         return;
       }
-      const result = peekChatMetadata(client, agentId);
-      if (!result) {
-        const snapshot = this.pendingContext?.gateway.snapshot;
-        if (snapshot?.phase !== "connected" || snapshot.client !== client) {
-          this.cancelMetadataRequest();
-          this.restoringPreference = false;
-          this.updateMetadataState({ ...this.metadataState, status: "offline" });
-          return;
-        }
+      const snapshot = this.pendingContext?.gateway.snapshot;
+      if (snapshot?.phase !== "connected" || snapshot.client !== client) {
+        this.metadataLoading = false;
+        this.restoringPreference = false;
+        this.updateMetadataState({ catalog: [], hasSnapshot: false, status: "offline" });
+        return;
+      }
+      if (update.type === "invalidated") {
         this.startMetadataRequest(client, agentId);
         return;
       }
-      this.cancelMetadataRequest();
-      this.publishMetadataCatalog(Array.isArray(result.models) ? result.models : [], "ready");
+      this.metadataLoading = update.type === "loading";
+      if (update.type === "result") {
+        this.publishMetadataCatalog(
+          Array.isArray(update.result.models) ? update.result.models : [],
+          "ready",
+        );
+      } else if (update.type === "loading") {
+        const status = this.metadataState.hasSnapshot ? "ready" : "loading";
+        if (this.metadataState.status !== status) {
+          this.updateMetadataState({ ...this.metadataState, status });
+        }
+      } else {
+        if (
+          this.pendingSelectionGeneration === this.selectionGeneration &&
+          (this.pendingPreference?.model || this.pendingPreference?.thinkingLevel)
+        ) {
+          // A transport failure cannot authorize a model or replace the requested preference.
+          this.selected = this.pendingPreference.model ?? "";
+          this.thinkingLevel = this.pendingPreference.thinkingLevel ?? "";
+        }
+        this.restoringPreference = false;
+        this.updateMetadataState({ ...this.metadataState, status: "error" });
+      }
     });
   }
 
@@ -275,14 +280,8 @@ export class NewSessionModelControl {
   }
 
   private startMetadataRequest(client: NewSessionMetadataClient, agentId: string) {
-    this.cancelMetadataRequest();
-    const requestId = ++this.metadataRequestId;
-    this.activeMetadataRequest = {
-      agentId,
-      client,
-      id: requestId,
-    };
-    const cached = peekChatMetadata(client, agentId);
+    this.metadataLoading = true;
+    const cached = peekChatMetadata(client, { agentId });
     if (Array.isArray(cached?.models)) {
       this.publishMetadataCatalog(cached.models, "ready");
     } else {
@@ -292,40 +291,13 @@ export class NewSessionModelControl {
       });
     }
 
-    void revalidateChatMetadata(client, agentId, {
-      startupRetryWindowMs: 60_000,
-    }).then(
-      () => {
-        // Accepted results publish through the store subscription. The request
-        // only retains ownership here when a newer writer superseded it.
-        if (this.activeMetadataRequest?.id !== requestId) {
-          return;
-        }
-        this.activeMetadataRequest = undefined;
+    void revalidateChatMetadata(
+      client,
+      { agentId },
+      {
+        startupRetryWindowMs: 60_000,
       },
-      () => {
-        if (this.activeMetadataRequest?.id !== requestId) {
-          return;
-        }
-        this.activeMetadataRequest = undefined;
-        this.metadataState = {
-          ...this.metadataState,
-          status: "error",
-        };
-        if (
-          this.pendingSelectionGeneration === this.selectionGeneration &&
-          (this.pendingPreference?.model || this.pendingPreference?.thinkingLevel)
-        ) {
-          // A transport failure says nothing about current availability.
-          // Preserve the requested pair so sessions.create remains the
-          // authoritative validator instead of silently using defaults.
-          this.selected = this.pendingPreference.model ?? "";
-          this.thinkingLevel = this.pendingPreference.thinkingLevel ?? "";
-        }
-        this.restoringPreference = false;
-        this.notify();
-      },
-    );
+    ).catch(() => undefined);
   }
 
   private retryPickerCatalogs(refreshReadyMetadata = false) {
@@ -382,7 +354,7 @@ export class NewSessionModelControl {
   }
 
   invalidate(resetSelection = false) {
-    this.cancelMetadataRequest();
+    this.metadataLoading = false;
     this.clearCatalogTargets();
     this.restoringPreference = false;
     if (resetSelection) {
@@ -418,10 +390,13 @@ export class NewSessionModelControl {
     const snapshot = context?.gateway.snapshot;
     const client = snapshot?.client;
     const normalizedAgentId = agentId.trim() ? normalizeAgentId(agentId) : "";
-    if (this.agentId !== normalizedAgentId) {
+    if (
+      this.agentId !== normalizedAgentId ||
+      (this.metadataClient && this.metadataClient !== client)
+    ) {
       // Catalog availability belongs to an agent. A real owner change clears
       // the snapshot; same-agent refreshes retain it until replacement.
-      this.cancelMetadataRequest();
+      this.metadataLoading = false;
       this.clearMetadataSubscription();
       this.agentId = normalizedAgentId;
       this.metadataClient = undefined;
@@ -436,13 +411,14 @@ export class NewSessionModelControl {
     }
     const selectionGeneration = this.selectionGeneration;
     if (!context || snapshot?.phase !== "connected" || !client || !normalizedAgentId || !enabled) {
-      this.cancelMetadataRequest();
+      this.metadataLoading = false;
       this.clearMetadataSubscription();
       this.metadataClient = undefined;
       this.restoringPreference = false;
       if (context && snapshot?.phase !== "connected") {
         this.metadataState = {
-          ...this.metadataState,
+          catalog: [],
+          hasSnapshot: false,
           status: "offline",
         };
       }
@@ -457,11 +433,8 @@ export class NewSessionModelControl {
     this.restoringPreference = Boolean(
       options.preference?.model || options.preference?.thinkingLevel,
     );
-    const activeRequestMatches =
-      this.activeMetadataRequest?.client === client &&
-      this.activeMetadataRequest.agentId === normalizedAgentId;
-    const cached = peekChatMetadata(client, normalizedAgentId);
-    if (activeRequestMatches) {
+    const cached = peekChatMetadata(client, { agentId: normalizedAgentId });
+    if (this.metadataLoading) {
       if (cached) {
         this.publishMetadataCatalog(Array.isArray(cached.models) ? cached.models : [], "ready");
       } else {
@@ -483,7 +456,7 @@ export class NewSessionModelControl {
   modelUnavailableReason(
     agent: GatewayAgentRow | undefined,
   ): ModelCatalogEntry["unavailableReason"] {
-    return this.metadataState.hasSnapshot && this.metadataState.status === "ready"
+    return this.metadataState.hasSnapshot && this.metadataState.status !== "offline"
       ? resolveChatModelUnavailableReason(
           this.selected || agent?.model?.primary,
           undefined,
