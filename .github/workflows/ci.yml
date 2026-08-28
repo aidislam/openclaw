@@ -306,12 +306,14 @@ jobs:
               try:
                   os.killpg(pgid, signum)
               except ProcessLookupError:
-                  pass
+                  return False
               except PermissionError:
                   # Darwin can report EPERM for a zombie-only group. Only a checked
                   # census proving no live members can authorize continuing.
                   if group_alive(pgid, deadline):
                       raise
+                  return False
+              return True
 
 
           def group_alive(pgid, deadline):
@@ -366,6 +368,13 @@ jobs:
                           time.sleep(0.05)
                   except Exception:
                       group_signal(child.pid, signal.SIGKILL, deadline)
+                      # KILL queues termination; a leader wait cannot join descendants.
+                      # Count zombies conservatively here, but never reset the allowance or retry.
+                      while time.monotonic() < deadline:
+                          child.poll()
+                          if not group_signal(child.pid, 0, deadline):
+                              break
+                          time.sleep(0.05)
                       child.wait(timeout=max(0.001, deadline - time.monotonic()))
                       raise
 
