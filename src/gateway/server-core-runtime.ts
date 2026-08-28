@@ -39,6 +39,9 @@ import { resolveGrantExpiryDaysConfig } from "./standing-grant-expiry-config.js"
 
 type GatewayLifecycle = Awaited<ReturnType<typeof prepareGatewayLifecycle>>;
 type GatewayLogger = ReturnType<typeof createSubsystemLogger>;
+type GatewayEarlyRuntime = Awaited<
+  ReturnType<typeof import("./server-startup-early.js").startGatewayEarlyRuntime>
+>;
 
 type GatewayStartupChannelPlugin = {
   id: ChannelId;
@@ -171,56 +174,62 @@ export async function startGatewayCoreRuntime(input: {
   if (secretEgressProxy) {
     kernel.addGatewayLifetimeSidecar(secretEgressProxy);
   }
-  const earlyRuntime = await startupTrace.measure("runtime.early", () =>
-    loadGatewayStartupEarlyModule().then(({ startGatewayEarlyRuntime }) =>
-      startGatewayEarlyRuntime({
-        minimalTestGateway,
-        cfgAtStart,
-        port,
-        gatewayTls,
-        gatewayDirectReachable: !isLoopbackHost(bindHost),
-        tailscaleMode,
-        log,
-        logDiscovery,
-        nodeRegistry,
-        swapBonjourStop: kernel.swapBonjourStop,
-        pluginRegistry: pluginRuntime.registry,
-        broadcast,
-        nodeSendToAllSubscribed,
-        getPresenceVersion,
-        getHealthVersion,
-        refreshGatewayHealthSnapshot: refreshGatewayHealthSnapshotWithRuntime,
-        restartRunningChannels: async () =>
-          await restartRunningChannelAccounts(channelManager, {
-            shouldContinue: () => !isGatewayWorkAdmissionClosed(),
-            onError: (message) => logHealth.error(message),
+  let earlyRuntimePromise: Promise<GatewayEarlyRuntime> | undefined;
+  const startEarlyRuntime = (): Promise<GatewayEarlyRuntime> =>
+    (earlyRuntimePromise ??= startupTrace
+      .measure("runtime.early", () =>
+        loadGatewayStartupEarlyModule().then(({ startGatewayEarlyRuntime }) =>
+          startGatewayEarlyRuntime({
+            minimalTestGateway,
+            cfgAtStart,
+            port,
+            gatewayTls,
+            gatewayDirectReachable: !isLoopbackHost(bindHost),
+            tailscaleMode,
+            log,
+            logDiscovery,
+            nodeRegistry,
+            swapBonjourStop: kernel.swapBonjourStop,
+            pluginRegistry: pluginRuntime.registry,
+            broadcast,
+            nodeSendToAllSubscribed,
+            getPresenceVersion,
+            getHealthVersion,
+            refreshGatewayHealthSnapshot: refreshGatewayHealthSnapshotWithRuntime,
+            restartRunningChannels: async () =>
+              await restartRunningChannelAccounts(channelManager, {
+                shouldContinue: () => !isGatewayWorkAdmissionClosed(),
+                onError: (message) => logHealth.error(message),
+              }),
+            refreshPresence: () =>
+              broadcastPresenceSnapshot({ broadcast, incrementPresenceVersion, getHealthVersion }),
+            resetEventLoopHealth: readinessEventLoopHealth.reset,
+            logHealth,
+            dedupe,
+            chatAbortControllers,
+            chatQueuedTurns,
+            restartRecoveryCandidates,
+            chatRunState,
+            removeChatRun,
+            agentRunSeq,
+            nodeSendToSession,
+            ...(typeof cfgAtStart.attachments?.ttlHours === "number"
+              ? { mediaCleanupTtlMs: resolveMediaCleanupTtlMs(cfgAtStart.attachments.ttlHours) }
+              : {}),
+            skillsRefreshDelayMs: runtimeState.skillsRefreshDelayMs,
+            getSkillsRefreshTimer: () => runtimeState.skillsRefreshTimer,
+            setSkillsRefreshTimer: (timer) => {
+              runtimeState.skillsRefreshTimer = timer;
+            },
+            getRuntimeConfig,
+            startupTrace,
           }),
-        refreshPresence: () =>
-          broadcastPresenceSnapshot({ broadcast, incrementPresenceVersion, getHealthVersion }),
-        resetEventLoopHealth: readinessEventLoopHealth.reset,
-        logHealth,
-        dedupe,
-        chatAbortControllers,
-        chatQueuedTurns,
-        restartRecoveryCandidates,
-        chatRunState,
-        removeChatRun,
-        agentRunSeq,
-        nodeSendToSession,
-        ...(typeof cfgAtStart.attachments?.ttlHours === "number"
-          ? { mediaCleanupTtlMs: resolveMediaCleanupTtlMs(cfgAtStart.attachments.ttlHours) }
-          : {}),
-        skillsRefreshDelayMs: runtimeState.skillsRefreshDelayMs,
-        getSkillsRefreshTimer: () => runtimeState.skillsRefreshTimer,
-        setSkillsRefreshTimer: (timer) => {
-          runtimeState.skillsRefreshTimer = timer;
-        },
-        getRuntimeConfig,
-        startupTrace,
-      }),
-    ),
-  );
-  kernel.setEarlyRuntimeHandles(earlyRuntime);
+        ),
+      )
+      .then((earlyRuntime) => {
+        kernel.setEarlyRuntimeHandles(earlyRuntime);
+        return earlyRuntime;
+      }));
 
   const [{ startGatewayEventSubscriptions }, { startGatewayChannelHealthMonitor }] =
     await startupTrace.measure("runtime.post-early-imports", () =>
@@ -657,7 +666,7 @@ export async function startGatewayCoreRuntime(input: {
       ...kernel,
       reloadPlugins: reloadAttachedGatewayPlugins,
     },
-    earlyRuntime,
+    startEarlyRuntime,
     sessionCompanion,
     sessionObserver,
     approvalSessionEvents,
