@@ -880,9 +880,6 @@ export async function syncSelectedSessionMessageSubscription(
   if (!nextKey) {
     return;
   }
-  await retryPendingSessionMessageSubscriptionReleases(state);
-  const paneRequests = getChatHistoryPaneRequests(state);
-  const generation = ++paneRequests.subscriptionGeneration;
   const previousRequestedKey = normalizeSubscriptionKey(
     state.chatSessionMessageSubscriptionRequestedKey,
   );
@@ -894,6 +891,13 @@ export async function syncSelectedSessionMessageSubscription(
     nextSubscriptionAgentId !== null &&
     previousSelectedKey === nextKey &&
     (previousSubscription?.agentId ?? null) !== nextSubscriptionAgentId;
+  if (selectedAgentChanged) {
+    state.chatSessionApprovalQueue = [];
+    state.requestUpdate?.();
+  }
+  const paneRequests = getChatHistoryPaneRequests(state);
+  const generation = ++paneRequests.subscriptionGeneration;
+  await retryPendingSessionMessageSubscriptionReleases(state);
   const selectedKeyChanged = previousSelectedKey !== null && previousSelectedKey !== nextKey;
   const shouldUnsubscribePrevious =
     previousSubscription !== null &&
