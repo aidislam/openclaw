@@ -1,15 +1,17 @@
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { getProcessStartTime, isPidAlive } from "../../../src/shared/pid-alive.ts";
+import { getProcessStartTime } from "../../../src/shared/pid-alive.ts";
 
 const [mode, root, policyScenario, ...args] = process.argv.slice(2);
 const linux = policyScenario.startsWith("linux:");
 const scenario = linux ? policyScenario.slice("linux:".length) : policyScenario;
 const fixture = fileURLToPath(import.meta.url);
+const instance = randomUUID();
 const workspace = path.join(root, "workspace");
 const lease = path.join(root, "lease");
 const recordsDir = path.join(root, "pids");
@@ -41,7 +43,7 @@ function publish(name, value) {
 }
 
 function record(pid, role, attempt = 0) {
-  publish(`pids/${pid}.json`, { pid, role, attempt });
+  publish(`pids/${pid}.json`, { pid, role, attempt, instance: `${instance}-${pid}` });
 }
 
 function records() {
@@ -54,29 +56,51 @@ function records() {
 }
 
 function liveRecords() {
-  const owned = records();
-  if (process.platform === "win32") {
-    return owned.filter((entry) => isPidAlive(entry.pid));
-  }
-  // PID existence includes macOS zombies; observe active writers in one POSIX snapshot.
-  const result = spawnSync("/bin/ps", ["-axo", "pid=,stat="], {
-    encoding: "utf8",
-    timeout: 1_000,
-  });
-  if (result.error || result.status !== 0) {
-    throw new Error(`Fixture process census failed (${result.error?.code ?? result.status})`);
-  }
+  const owned = records().filter(
+    (entry) => !fs.existsSync(path.join(recordsDir, `${entry.instance}.dead`)),
+  );
   const alive = new Set();
-  for (const line of result.stdout.trim().split("\n")) {
-    const [pid, state] = line.trim().split(/\s+/u);
-    if (!Number.isInteger(Number(pid)) || !state) {
-      throw new Error("Fixture process census returned an invalid row");
+  if (process.platform === "win32") {
+    for (const { pid } of owned) {
+      try {
+        process.kill(pid, 0);
+        alive.add(pid);
+      } catch (error) {
+        if (error.code === "EPERM") {
+          alive.add(pid);
+        } else if (error.code !== "ESRCH") {
+          throw error;
+        }
+      }
     }
-    if (!state.startsWith("Z")) {
-      alive.add(Number(pid));
+  } else {
+    // PID existence includes macOS zombies; observe active writers in one POSIX snapshot.
+    const result = spawnSync("/bin/ps", ["-axo", "pid=,stat="], {
+      encoding: "utf8",
+      timeout: 1_000,
+    });
+    if (result.error || result.status !== 0) {
+      throw new Error(`Fixture process census failed (${result.error?.code ?? result.status})`);
+    }
+    for (const line of result.stdout.trim().split("\n")) {
+      const [pid, state] = line.trim().split(/\s+/u);
+      if (!Number.isInteger(Number(pid)) || !state) {
+        throw new Error("Fixture process census returned an invalid row");
+      }
+      if (!state.startsWith("Z")) {
+        alive.add(Number(pid));
+      }
     }
   }
-  return owned.filter((entry) => alive.has(entry.pid));
+  return owned.filter((entry) => {
+    if (alive.has(entry.pid)) {
+      return true;
+    }
+    // Separate command processes share this observed-dead fact. PID reuse cannot
+    // revive that instance, while a newly registered instance is still checked.
+    fs.writeFileSync(path.join(recordsDir, `${entry.instance}.dead`), "");
+    return false;
+  });
 }
 
 function boundary(name) {
