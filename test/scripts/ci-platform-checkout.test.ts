@@ -295,7 +295,7 @@ with subprocess.Popen([sys.executable, "-I", "-S", "-c", "pass"], start_new_sess
         for pid, role, attempt in [(child.pid, "grandchild", 1), (os.getpid(), "sentinel", 0)]:
             (root / "pids" / f"{pid}.json").write_text(json.dumps(dict(pid=pid, role=role, attempt=attempt)))
         subprocess.run([sys.argv[1], sys.argv[2], "git", directory, "early-leader-exit",
-                        "-C", str(root / "workspace"), "checkout"], check=True)
+                        "-C", str(root / "workspace"), "checkout"], cwd=root / "workspace", check=True)
         observed = json.loads((root / "events.jsonl").read_text())
         assert observed["alive"] == [], "fixture counted a terminated zombie as a live writer"
         assert observed["sentinelAlive"]
