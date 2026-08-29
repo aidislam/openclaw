@@ -590,6 +590,7 @@ export function createApplicationOverlays(
       if (!active || promptState.execApprovalBusy || disposed) {
         return;
       }
+      const isProjectedApproval = active === projectedApproval;
       if (!client || gateway.snapshot.phase !== "connected") {
         promptState.execApprovalErrors.set(active.id, t("sessionsView.actionRequiresConnection"));
         publish();
@@ -639,7 +640,8 @@ export function createApplicationOverlays(
         }
         if (
           isCurrentOperation() &&
-          promptState.execApprovalQueue.some((entry) => entry.id === active.id)
+          (isProjectedApproval ||
+            promptState.execApprovalQueue.some((entry) => entry.id === active.id))
         ) {
           promptState.execApprovalErrors.set(active.id, `Approval failed: ${formatUiError(error)}`);
         }
