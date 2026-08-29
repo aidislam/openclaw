@@ -547,13 +547,26 @@ describe("runMemoryFlushIfNeeded", () => {
   });
 
   it.each([
-    [8_767, false, false],
-    [8_768, true, false],
-    [12_767, true, false],
-    [12_768, true, true],
+    ["default", 8_767, false, false],
+    ["default", 8_768, true, false],
+    ["default", 12_767, true, false],
+    ["default", 12_768, true, true],
+    ["custom", 18_767, false, false],
+    ["custom", 18_768, true, false],
+    ["custom", 20_767, true, false],
+    ["custom", 20_768, true, true],
   ] as const)(
-    "separates early flush and blocking compaction at %i tokens",
-    async (totalTokens, flushExpected, compactionExpected) => {
+    "separates early flush and blocking compaction for %s plan at %i tokens",
+    async (plan, totalTokens, flushExpected, compactionExpected) => {
+      if (plan === "custom") {
+        registerMemoryCapability("third-party-memory", {
+          flushPlanResolver: () =>
+            createModifiedMemoryFlushPlan({
+              reserveTokensFloor: 12_000,
+              softThresholdTokens: 2_000,
+            }),
+        });
+      }
       const entry = createFlushSessionEntry({ totalTokens, compactionCount: 0 });
       const storePath = path.join(rootDir, "sessions.json");
       await writeTestSessionStore(storePath, "main", entry);
