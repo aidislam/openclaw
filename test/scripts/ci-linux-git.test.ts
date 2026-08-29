@@ -20,6 +20,7 @@ type ProcessRecord = { pid: number; role: string; attempt: number };
 type Command = { tool: string; cwd: string; args: string[] };
 type Report = {
   code: number | null;
+  cancelledDuringCleanup: boolean;
   error?: string;
   boundaries: { name: string; alive: ProcessRecord[]; sentinelAlive: boolean }[];
   readyAttempts: number[];
@@ -91,12 +92,21 @@ function stepEnvironment(step: Step, supplied: Record<string, string>) {
   return resolved;
 }
 
-function accelerate(run: string) {
-  // Shorten the fetch/backoff clock, never the real process teardown allowance.
+function accelerate(run: string, timeoutReadyFile?: string) {
+  // For cancellation, advance this copy's timeout only after full tree readiness
+  // and retain the real TERM grace so the signal reaches drain, not startup.
+  const timeoutCheck = "if deadline is not None and time.monotonic() >= deadline:";
+  const readyCheck = timeoutReadyFile
+    ? `if deadline is not None and os.path.isfile(${JSON.stringify(timeoutReadyFile)}):`
+    : timeoutCheck;
+  const killAt = timeoutReadyFile
+    ? "kill_at = deadline - cleanup_seconds / 2"
+    : "kill_at = time.monotonic()";
   return (
     run
       .replace(/fetch_timeout_seconds = [^\n]+/u, "fetch_timeout_seconds = 2")
-      .replace("kill_at = deadline - cleanup_seconds / 2", "kill_at = time.monotonic()")
+      .replace(timeoutCheck, readyCheck)
+      .replace("kill_at = deadline - cleanup_seconds / 2", killAt)
       .replace(/retry_at = time\.monotonic\(\) \+ [^\n]+/u, "retry_at = time.monotonic() + 0.05")
       .replaceAll("--git 120", "--git 2")
       // Keep pre-fix standalone shell bodies executable for red/green proof.
@@ -114,6 +124,7 @@ async function runStep(options: {
   checkoutResults?: number[];
   mergeSnapshots?: { sha: string; head: string }[];
   prepare?: boolean;
+  cancelDuringCleanup?: boolean;
   revisions?: Record<string, string>;
   poisonPython?: boolean;
 }) {
@@ -154,13 +165,15 @@ async function runStep(options: {
       checkoutResults: options.checkoutResults,
       mergeSnapshots: options.mergeSnapshots,
       consumers: options.prepare ?? false,
+      cancelDuringCleanup: options.cancelDuringCleanup,
     }),
   );
-  let run = accelerate(step.run);
+  const readyFile = options.cancelDuringCleanup ? path.join(root, "ready-1.json") : undefined;
+  let run = accelerate(step.run, readyFile);
   if (options.prepare) {
     const prepare = workflowStep("security-fast", "Prepare Git owner");
     const prepareEnv = stepEnvironment(prepare, {});
-    writeFileSync(path.join(root, "prepare.sh"), accelerate(prepare.run));
+    writeFileSync(path.join(root, "prepare.sh"), accelerate(prepare.run, readyFile));
     // Run the actual prepare body in its own shell: its exec must not replace the caller.
     run = `CHECKOUT_KIND=${prepareEnv.CHECKOUT_KIND} bash --noprofile --norc -eo pipefail "$TMPDIR/prepare.sh"\n${run}`;
   }
@@ -610,6 +623,25 @@ linuxIt(
     ).toEqual(["fetch:1", "show-parents", "fetch:2", "show-parents", "checkout"]);
     expect(report.checkouts.map(({ args }) => args.at(-1))).toEqual([merge]);
     expect(report.githubEnv).toBe(`RATCHET_BASE_REF=${base}\n`);
+  },
+  55_000,
+);
+
+linuxIt(
+  "cancellation during raw Git timeout cleanup prevents npm-lock fallback",
+  async () => {
+    const report = await runStep({
+      job: "check-shard",
+      step: "Run check shard",
+      env: { TASK: "npm-lock" },
+      fetchResults: ["hang"],
+      prepare: true,
+      cancelDuringCleanup: true,
+    });
+    expect(report.cancelledDuringCleanup).toBe(true);
+    expect(report.code).toBe(143);
+    expect(report.fetches).toHaveLength(1);
+    expect(report.commands.filter(({ tool }) => tool === "pnpm")).toEqual([]);
   },
   55_000,
 );

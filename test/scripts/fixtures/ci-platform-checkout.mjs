@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { isPidAlive } from "../../../src/shared/pid-alive.ts";
+import { getProcessStartTime, isPidAlive } from "../../../src/shared/pid-alive.ts";
 
 const [mode, root, policyScenario, ...args] = process.argv.slice(2);
 const linux = policyScenario.startsWith("linux:");
@@ -148,7 +148,11 @@ async function command() {
   }
   if (mode === "child" || mode === "grandchild") {
     const attempt = Number(args[0]);
-    process.on("SIGTERM", () => {});
+    process.on("SIGTERM", () => {
+      if (options.cancelDuringCleanup) {
+        publish("cleanup-started.json", attempt);
+      }
+    });
     record(process.pid, mode, attempt);
     if (mode === "child") {
       // Startup faults belong to the caller, not every consumer of this shared fixture.
@@ -220,6 +224,11 @@ async function command() {
     boundary(`fetch:${attempt}`);
     publish("attempt.json", attempt);
     record(process.pid, "parent", attempt);
+    if (options.cancelDuringCleanup) {
+      const pid = process.ppid;
+      publish("owner.json", { pid, startTime: getProcessStartTime(pid) });
+      record(pid, "owner");
+    }
     launch("child", attempt);
     await until(() => fs.existsSync(path.join(root, `ready-${attempt}.json`)), "tree readiness");
     if (scenario.startsWith("cancel-")) {
@@ -374,6 +383,7 @@ async function supervise() {
   let stopping;
   const report = {
     code: null,
+    cancelledDuringCleanup: false,
     boundaries: [],
     readyAttempts: [],
     cleanupRemaining: [],
@@ -521,6 +531,25 @@ async function supervise() {
       record(shell.pid, "shell");
     }
     const exited = once(shell, "exit");
+    if (options.cancelDuringCleanup) {
+      await until(
+        () => fs.existsSync(path.join(root, "cleanup-started.json")),
+        "cleanup readiness",
+      );
+      const owner = JSON.parse(fs.readFileSync(path.join(root, "owner.json"), "utf8"));
+      const ownerStatus = fs.readFileSync(`/proc/${owner.pid}/status`, "utf8");
+      const parentPid = Number(ownerStatus.match(/^PPid:\s+(\d+)$/mu)?.[1]);
+      // The raw owner is a child of Bash; bind the signal to the birth identity Git observed.
+      if (
+        parentPid !== shell.pid ||
+        owner.startTime === null ||
+        getProcessStartTime(owner.pid) !== owner.startTime
+      ) {
+        throw new Error("Raw Git owner changed before cleanup cancellation");
+      }
+      process.kill(owner.pid, "SIGTERM");
+      report.cancelledDuringCleanup = true;
+    }
     const [code] = await exited;
     report.code = code;
     boundary("exit");

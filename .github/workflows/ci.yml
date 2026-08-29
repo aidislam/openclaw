@@ -425,7 +425,8 @@ jobs:
                   finally:
                       if job is not None:
                           close_handle(job)
-              check_cancelled()
+                  # After verified cleanup, cancellation must supersede a pending timeout.
+                  check_cancelled()
               if child.returncode:
                   raise GitFailure(child.returncode if child.returncode > 0 else 128 - child.returncode)
 
